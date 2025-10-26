@@ -32,10 +32,6 @@ TMI_INDEX_RATE <- 0.0175
 GAMMA_ACTIONS <- -0.005
 GAMMA_OBLIGATIONS <- -0.010
 
-# --- Paramètres IR (décote célibataire ; barème indexé via TMI_INDEX_RATE)
-DECO_A_SINGLE <- 865
-DECO_SLOPE    <- 0.4525
-
 # ============================================
 # Utilitaires généraux
 # ============================================
@@ -378,39 +374,6 @@ compute_montant_a_combler <- function(mykey, cas_type, generation, ref_tbl,
 }
 
 # ============================================
-# Fonctions IR (barème progressif + décote), à partir de NET perçu
-# ============================================
-.seuils_indexes <- function(annee, base_year = ANNEE_DEBUT,
-                            thresh_base = TMI_THRESH_BASE, index_rate = TMI_INDEX_RATE) {
-  k <- max(0L, as.integer(annee - base_year))
-  idx <- (1 + index_rate)^k
-  thresh_base * idx
-}
-
-# calc_ir() prend un revenu imposable (après CSG non déductible et après abattement 10%)
-calc_ir <- function(rev, annee = ANNEE_DEBUT) {
-  if (!is.finite(rev) || rev <= 0) return(0)
-  b <- .seuils_indexes(annee)
-  ir <- 0
-  if (rev > b[1]) ir <- ir + 0.11 * (pmin(rev, b[2]) - b[1])
-  if (rev > b[2]) ir <- ir + 0.30 * (pmin(rev, b[3]) - b[2])
-  if (rev > b[3]) ir <- ir + 0.41 * (pmin(rev, b[4]) - b[3])
-  if (rev > b[4]) ir <- ir + 0.45 * (rev - b[4])
-  # décote célibataire
-  decote <- DECO_A_SINGLE - DECO_SLOPE * ir
-  if (decote > 0) ir <- max(ir - decote, 0)
-  ir
-}
-
-# Helpers fiscaux à partir d'un salaire NET perçu 'pay'
-net_to_fiscal <- function(pay) pay * 1.03  # + CSG non déductible ~3%
-apply_abattement_10 <- function(net_fiscal) {
-  abatt <- 0.10 * net_fiscal
-  abatt <- pmin(pmax(abatt, 495), 14171)   # bornes 2025
-  pmax(net_fiscal - abatt, 0)
-}
-
-# ============================================
 # A) Déterministe
 # ============================================
 simuler_id <- function(id, generation, taux_cotisation, tables) {
@@ -439,38 +402,22 @@ simuler_id <- function(id, generation, taux_cotisation, tables) {
   taux_conv <- tables$conv$Taux_conversion[tables$conv$Generation == generation]
   if (!length(taux_conv)) stop(sprintf("Taux de conversion manquant pour génération %d", generation))
   
-  # --- Défiscalisation PER exacte (CSG ND + abattement 10% + barème + décote)
-  net_fiscal <- net_to_fiscal(pay_vec)                       # +3%
-  rev_imposable <- apply_abattement_10(net_fiscal)           # -10% borné
-  plafond_PER <- PLAFOND_DEFISC_PCT * net_fiscal             # 10% du net fiscal (avant abattement)
-  deduction_PER <- pmin(cot_vec, plafond_PER)
-  
-  defisc_vec <- mapply(function(R, D, y) {
-    IR0 <- calc_ir(R, y)
-    IR1 <- calc_ir(max(R - D, 0), y)
-    IR0 - IR1
-  }, R = rev_imposable, D = deduction_PER, y = years)
-  defisc <- sum(defisc_vec, na.rm = TRUE)
-  taux_eff <- if (remu_cum > 0) (cot_tot - defisc) / remu_cum else NA_real_
-  
-  # --- Prestations (inchangé)
   cap <- simuler_capital(cot_vec, tables$perf)
   rb <- cap * taux_conv
   rnet <- (rb - rb * FRAIS_ARERAGE) - (rb * PRORATA_RVTG * rvtg) - (rb * PRORATA_PS * TAUX_PS)
   rnet_mens <- rnet / 12
   
-  # --- Montant à combler (inchangé)
+  tmi_vec <- mapply(TMI_from_income_dyn, rev = pay_vec, annee = years)
+  base_ded <- pmin(cot_vec, PLAFOND_DEFISC_PCT * pay_vec)
+  defisc <- sum(base_ded * tmi_vec, na.rm = TRUE)
+  taux_eff <- if (remu_cum > 0) (cot_tot - defisc) / remu_cum else NA_real_
+  
   mc <- compute_montant_a_combler(mykey, cas_type, generation, tables$ref, remu_tbl = tables$remu, years = years)
   rnet_unit <- .simuler_unitaire_net(pay_vec, tables$perf, taux_conv, rvtg)
   t_combler <- if (!is.na(mc$montant_a_combler) && is.finite(rnet_unit) && rnet_unit > 0) mc$montant_a_combler / rnet_unit else NA_real_
   t_eff_combler <- if (!is.na(t_combler) && remu_cum > 0) {
     cot_req <- t_combler * pay_vec
-    def_req_vec <- mapply(function(R, D, y) {
-      IR0 <- calc_ir(R, y)
-      IR1 <- calc_ir(max(R - D, 0), y)
-      IR0 - IR1
-    }, R = rev_imposable, D = pmin(cot_req, plafond_PER), y = years)
-    def_req <- sum(def_req_vec, na.rm = TRUE)
+    def_req <- sum(pmin(cot_req, PLAFOND_DEFISC_PCT * pay_vec) * tmi_vec, na.rm = TRUE)
     (sum(cot_req, na.rm = TRUE) - def_req) / remu_cum
   } else NA_real_
   
@@ -552,20 +499,11 @@ simuler_id_MC <- function(id, generation, taux_cotisation, tables, M = 100000,
   taux_conv <- tables$conv$Taux_conversion[tables$conv$Generation == generation]
   if (!length(taux_conv)) stop(sprintf("Taux de conversion manquant pour génération %d", generation))
   
-  # --- Défiscalisation PER exacte (CSG ND + abattement 10% + barème + décote)
-  net_fiscal <- net_to_fiscal(pay_vec)
-  rev_imposable <- apply_abattement_10(net_fiscal)
-  plafond_PER <- PLAFOND_DEFISC_PCT * net_fiscal
-  deduction_PER <- pmin(cot_vec, plafond_PER)
-  defisc_vec <- mapply(function(R, D, y) {
-    IR0 <- calc_ir(R, y)
-    IR1 <- calc_ir(max(R - D, 0), y)
-    IR0 - IR1
-  }, R = rev_imposable, D = deduction_PER, y = years)
-  defisc <- sum(defisc_vec, na.rm = TRUE)
+  tmi_vec <- mapply(TMI_from_income_dyn, rev = pay_vec, annee = years)
+  base_ded <- pmin(cot_vec, PLAFOND_DEFISC_PCT * pay_vec)
+  defisc <- sum(base_ded * tmi_vec, na.rm = TRUE)
   taux_eff <- if (remu_cum > 0) (cot_tot - defisc) / remu_cum else NA_real_
   
-  # --- MC capital et rentes (inchangé)
   mc <- compute_montant_a_combler(mykey, cas_type, generation, tables$ref, remu_tbl = tables$remu, years = years)
   K_unit <- simulate_unit_samples(pay_vec, tables$perf, years, M, sigma_eq, sigma_bd, w_start, w_end, tables$demo, rho)
   rnet_u <- rente_nette_from_capital(K_unit, taux_conv, rvtg)
@@ -633,12 +571,7 @@ simuler_id_MC <- function(id, generation, taux_cotisation, tables, M = 100000,
     tau_star <- if (!is.na(mc$montant_a_combler) && is.finite(q) && q > 0) mc$montant_a_combler / q else NA_real_
     tau_eff <- if (!is.na(tau_star) && remu_cum > 0) {
       cot_req <- tau_star * pay_vec
-      def_req_vec <- mapply(function(R, D, y) {
-        IR0 <- calc_ir(R, y)
-        IR1 <- calc_ir(max(R - D, 0), y)
-        IR0 - IR1
-      }, R = rev_imposable, D = pmin(cot_req, plafond_PER), y = years)
-      def_req <- sum(def_req_vec, na.rm = TRUE)
+      def_req <- sum(pmin(cot_req, PLAFOND_DEFISC_PCT * pay_vec) * tmi_vec, na.rm = TRUE)
       (sum(cot_req, na.rm = TRUE) - def_req) / remu_cum
     } else NA_real_
     res[[paste0("tau_star_", lab)]] <- tau_star
