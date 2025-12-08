@@ -1,6 +1,8 @@
 # ============================================
 # PERMAT – Modèle déterministe & Monte Carlo
 # Export Excel (avec ajustement démographique)
+# Objectifs TR spécifiques pour cas 3
+# + Cibles "moitié du gap de TR" vs gen 1960
 # ============================================
 
 # --- Packages ---
@@ -13,6 +15,7 @@ suppressPackageStartupMessages({
   library(tibble)
   library(openxlsx)
   library(readxl)
+  library(ggplot2)
 })
 
 # ============================================
@@ -29,8 +32,19 @@ PLAFOND_DEFISC_PCT <- 0.10
 TMI_THRESH_BASE <- c(11497, 29315, 83823, 180294)
 TMI_INDEX_RATE <- 0.0175
 
+# Ajustements démographiques des rendements
 GAMMA_ACTIONS <- -0.005
 GAMMA_OBLIGATIONS <- -0.010
+
+# Objectifs de taux de remplacement pour le cas 3 par génération (plein comblement)
+TR_OBJECTIFS_CAS3 <- c(
+  "1980" = 0.6492339, "1981" = 0.6457423, "1982" = 0.6428391, "1983" = 0.6397566,
+  "1984" = 0.6372416, "1985" = 0.6346842, "1986" = 0.6325324, "1987" = 0.6306867,
+  "1988" = 0.6292978, "1989" = 0.6281771, "1990" = 0.6268778, "1991" = 0.6259457,
+  "1992" = 0.6249482, "1993" = 0.6239760, "1994" = 0.6229540, "1995" = 0.6220974,
+  "1996" = 0.6213564, "1997" = 0.6205621, "1998" = 0.6198159, "1999" = 0.6195105,
+  "2000" = 0.6187678
+)
 
 # ============================================
 # Utilitaires généraux
@@ -211,7 +225,7 @@ TMI_from_income_dyn <- function(rev, annee, base_year = ANNEE_DEBUT,
   k <- max(0L, as.integer(annee - base_year))
   idx <- (1 + index_rate)^k
   b <- thresh_base * idx
-  case_when(
+  dplyr::case_when(
     rev <= b[1] ~ 0.00,
     rev <= b[2] ~ 0.11,
     rev <= b[3] ~ 0.30,
@@ -273,7 +287,7 @@ ajuster_mu_par_classe <- function(mu_fac, years, demo_series = NULL,
 # ============================================
 # Monte-Carlo
 # ============================================
-simulate_unit_samples <- function(pay_vec, perf_table, years, Mq = 100000,
+simulate_unit_samples <- function(pay_vec, perf_table, years, Mq = 50000,
                                   sigma_eq = 0.18, sigma_bd = 0.06,
                                   w_start = 0.70, w_end = 0.20,
                                   demo_series = NULL, rho = 0.10) {
@@ -305,7 +319,7 @@ rente_nette_from_capital <- function(cap, taux_conv, rvtg) {
 }
 
 # ============================================
-# Montant à combler
+# Montant à combler (plein & moitié du gap)
 # ============================================
 safe_tr <- function(x) {
   x <- suppressWarnings(as.numeric(x))
@@ -344,32 +358,64 @@ compute_montant_a_combler <- function(mykey, cas_type, generation, ref_tbl,
   net_avder <- extract_last_net(remu_tbl, mykey, years)
   if (!is.finite(net_avder)) net_avder <- net_avder_ref
   
-  tr_ref_1960 <- ref_tbl %>%
-    filter(cas_type == !!cas_type, generation == 1960L) %>%
-    pull(tr_net) %>%
-    safe_tr() %>%
-    median(na.rm = TRUE)
-  if (!is.finite(tr_ref_1960)) {
-    tr_ref_1960 <- ref_tbl %>%
-      filter(generation == 1960L) %>%
+  # Cible plein comblement
+  if (cas_type == 3) {
+    tr_objectif <- TR_OBJECTIFS_CAS3[as.character(generation)]
+    if (is.na(tr_objectif)) {
+      warning(sprintf("Pas d'objectif TR défini pour cas 3, génération %d. Utilisation de la logique standard.", generation))
+      tr_ref_1960 <- ref_tbl %>%
+        filter(cas_type == !!cas_type, generation == 1960L) %>%
+        pull(tr_net) %>%
+        safe_tr() %>%
+        median(na.rm = TRUE)
+      if (!is.finite(tr_ref_1960)) {
+        tr_ref_1960 <- ref_tbl %>%
+          filter(generation == 1960L) %>%
+          pull(tr_net) %>%
+          safe_tr() %>%
+          median(na.rm = TRUE)
+      }
+      tr_objectif <- tr_ref_1960
+    }
+  } else {
+    tr_objectif <- ref_tbl %>%
+      filter(cas_type == !!cas_type, generation == 1960L) %>%
       pull(tr_net) %>%
       safe_tr() %>%
       median(na.rm = TRUE)
+    if (!is.finite(tr_objectif)) {
+      tr_objectif <- ref_tbl %>%
+        filter(generation == 1960L) %>%
+        pull(tr_net) %>%
+        safe_tr() %>%
+        median(na.rm = TRUE)
+    }
+    if (!is.finite(tr_objectif)) tr_objectif <- NA_real_
   }
-  if (!is.finite(tr_ref_1960)) tr_ref_1960 <- NA_real_
   
   pension_actuelle <- if (!is.na(tr_gen_net) && !is.na(net_avder)) tr_gen_net * net_avder else NA_real_
-  pension_cible <- if (!is.na(tr_ref_1960) && !is.na(net_avder)) tr_ref_1960 * net_avder else NA_real_
+  pension_cible <- if (!is.na(tr_objectif) && !is.na(net_avder)) tr_objectif * net_avder else NA_real_
   montant <- if (!is.na(pension_cible) && !is.na(pension_actuelle)) pension_cible - pension_actuelle else NA_real_
   montant <- if (!is.na(montant)) max(0, montant) else NA_real_
   
+  # Cible "moitié du gap"
+  tr_cible_half <- if (!is.na(tr_gen_net) && !is.na(tr_objectif)) {
+    tr_gen_net + 0.5 * (tr_objectif - tr_gen_net)
+  } else NA_real_
+  pension_cible_half <- if (!is.na(tr_cible_half) && !is.na(net_avder)) tr_cible_half * net_avder else NA_real_
+  montant_half <- if (!is.na(pension_cible_half) && !is.na(pension_actuelle)) pension_cible_half - pension_actuelle else NA_real_
+  montant_half <- if (!is.na(montant_half)) max(0, montant_half) else NA_real_
+  
   list(
     tr_gen_net = tr_gen_net,
-    tr_ref_1960 = tr_ref_1960,
+    tr_objectif = tr_objectif,
+    tr_cible_half = tr_cible_half,
     net_avder = net_avder,
     pension_actuelle_nette = pension_actuelle,
     pension_cible_nette = pension_cible,
-    montant_a_combler = montant
+    pension_cible_nette_half = pension_cible_half,
+    montant_a_combler = montant,
+    montant_a_combler_half = montant_half
   )
 }
 
@@ -414,9 +460,17 @@ simuler_id <- function(id, generation, taux_cotisation, tables) {
   
   mc <- compute_montant_a_combler(mykey, cas_type, generation, tables$ref, remu_tbl = tables$remu, years = years)
   rnet_unit <- .simuler_unitaire_net(pay_vec, tables$perf, taux_conv, rvtg)
+  
   t_combler <- if (!is.na(mc$montant_a_combler) && is.finite(rnet_unit) && rnet_unit > 0) mc$montant_a_combler / rnet_unit else NA_real_
   t_eff_combler <- if (!is.na(t_combler) && remu_cum > 0) {
     cot_req <- t_combler * pay_vec
+    def_req <- sum(pmin(cot_req, PLAFOND_DEFISC_PCT * pay_vec) * tmi_vec, na.rm = TRUE)
+    (sum(cot_req, na.rm = TRUE) - def_req) / remu_cum
+  } else NA_real_
+  
+  t_combler_half <- if (!is.na(mc$montant_a_combler_half) && is.finite(rnet_unit) && rnet_unit > 0) mc$montant_a_combler_half / rnet_unit else NA_real_
+  t_eff_combler_half <- if (!is.na(t_combler_half) && remu_cum > 0) {
+    cot_req <- t_combler_half * pay_vec
     def_req <- sum(pmin(cot_req, PLAFOND_DEFISC_PCT * pay_vec) * tmi_vec, na.rm = TRUE)
     (sum(cot_req, na.rm = TRUE) - def_req) / remu_cum
   } else NA_real_
@@ -435,44 +489,51 @@ simuler_id <- function(id, generation, taux_cotisation, tables) {
     rente_nette_recue = rnet,
     rente_nette_mensuelle = rnet_mens,
     tr_gen_net = mc$tr_gen_net,
-    tr_ref_1960 = mc$tr_ref_1960,
+    tr_objectif = mc$tr_objectif,
+    tr_cible_half = mc$tr_cible_half,
     net_avant_derniere = mc$net_avder,
     pension_actuelle_nette = mc$pension_actuelle_nette,
     pension_cible_nette = mc$pension_cible_nette,
+    pension_cible_nette_half = mc$pension_cible_nette_half,
     montant_a_combler = mc$montant_a_combler,
+    montant_a_combler_half = mc$montant_a_combler_half,
     taux_pour_combler_ecart = t_combler,
-    taux_effectif_pour_combler_ecart = t_eff_combler
+    taux_effectif_pour_combler_ecart = t_eff_combler,
+    taux_pour_moitie_ecart = t_combler_half,
+    taux_effectif_pour_moitie_ecart = t_eff_combler_half
   )
 }
 
 # ============================================
 # B) Monte-Carlo
 # ============================================
-simuler_id_MC <- function(id, generation, taux_cotisation, tables, M = 100000,
+simuler_id_MC <- function(id, generation, taux_cotisation, tables, M = 50000,
                           sigma_eq = 0.18, sigma_bd = 0.06, w_start = 0.70, w_end = 0.20,
-                          alphas = c(0.01, 0.05, 0.10), rho = 0.10) {
+                          alphas = c(0.01, 0.05, 0.10, 0.50), rho = 0.10) {
   N <- nb_annees_cotise(generation)
   if (N <= 0) {
     out <- tibble(id = id, cas_type = NA_integer_, generation = generation, N = N)
     cols_to_init <- c(
       "remu_brute_deflatee_cumulee", "cotisations_totales", "defisc_totale",
-      "taux_cotisation", "taux_cotisation_effectif", "tr_gen_net", "tr_ref_1960",
-      "net_avant_derniere", "pension_actuelle_nette", "pension_cible_nette",
-      "montant_a_combler", "capital_P1", "capital_P5", "capital_P10", "capital_P50",
-      "capital_P90", "capital_P95", "capital_P99", "rente_nette_P1", "rente_nette_P5",
-      "rente_nette_P10", "rente_nette_P50", "rente_nette_P90", "rente_nette_P95",
-      "rente_nette_P99", "tr_PER_P1", "tr_PER_P5", "tr_PER_P10", "tr_PER_P50",
-      "tr_PER_P90", "tr_PER_P95", "tr_PER_P99", "tr_total_P1", "tr_total_P5",
-      "tr_total_P10", "tr_total_P50", "tr_total_P90", "tr_total_P95", "tr_total_P99",
-      "gain_vs_ref_1960_P1", "gain_vs_ref_1960_P5", "gain_vs_ref_1960_P10", "gain_vs_ref_1960_P50",
-      "gain_vs_ref_1960_P90", "gain_vs_ref_1960_P95", "gain_vs_ref_1960_P99",
-      "prob_succes_au_taux", "taux_pour_combler_ecart"
+      "taux_cotisation", "taux_cotisation_effectif", "tr_gen_net", "tr_objectif",
+      "tr_cible_half", "net_avant_derniere", "pension_actuelle_nette", "pension_cible_nette",
+      "pension_cible_nette_half", "montant_a_combler", "montant_a_combler_half",
+      "capital_P1", "capital_P5", "capital_P10", "capital_P50", "capital_P90", "capital_P95", "capital_P99",
+      "rente_nette_P1", "rente_nette_P5", "rente_nette_P10", "rente_nette_P50", "rente_nette_P90", "rente_nette_P95", "rente_nette_P99",
+      "tr_PER_P1", "tr_PER_P5", "tr_PER_P10", "tr_PER_P50", "tr_PER_P90", "tr_PER_P95", "tr_PER_P99",
+      "tr_total_P1", "tr_total_P5", "tr_total_P10", "tr_total_P50", "tr_total_P90", "tr_total_P95", "tr_total_P99",
+      "gain_vs_objectif_P1", "gain_vs_objectif_P5", "gain_vs_objectif_P10", "gain_vs_objectif_P50",
+      "gain_vs_objectif_P90", "gain_vs_objectif_P95", "gain_vs_objectif_P99",
+      "prob_succes_au_taux", "prob_succes_au_taux_half",
+      "taux_pour_combler_ecart", "taux_pour_moitie_ecart"
     )
     for (nm in cols_to_init) out[[nm]] <- NA_real_
     for (a in alphas) {
       lab <- sprintf("%02d", round((1 - a) * 100))
       out[[paste0("tau_star_", lab)]] <- NA_real_
       out[[paste0("tau_effectif_star_", lab)]] <- NA_real_
+      out[[paste0("tau_star_half_", lab)]] <- NA_real_
+      out[[paste0("tau_effectif_star_half_", lab)]] <- NA_real_
     }
     return(out)
   }
@@ -508,21 +569,22 @@ simuler_id_MC <- function(id, generation, taux_cotisation, tables, M = 100000,
   K_unit <- simulate_unit_samples(pay_vec, tables$perf, years, M, sigma_eq, sigma_bd, w_start, w_end, tables$demo, rho)
   rnet_u <- rente_nette_from_capital(K_unit, taux_conv, rvtg)
   
+  # Distribution pour le taux courant
   caps_tau <- taux_cotisation * K_unit
   rnet_tau <- taux_cotisation * rnet_u
   quants <- c(0.01, 0.05, 0.10, 0.50, 0.90, 0.95, 0.99)
   q_cap <- quantile(caps_tau, quants, na.rm = TRUE, names = FALSE)
   q_rnt <- quantile(rnet_tau, quants, na.rm = TRUE, names = FALSE)
-  prob <- if (is.na(mc$montant_a_combler)) NA_real_ else mean(rnet_tau >= mc$montant_a_combler)
+  
+  prob_full <- if (is.na(mc$montant_a_combler)) NA_real_ else mean(rnet_tau >= mc$montant_a_combler)
+  prob_half <- if (is.na(mc$montant_a_combler_half)) NA_real_ else mean(rnet_tau >= mc$montant_a_combler_half)
   
   tr_per <- if (!is.na(mc$net_avder) && mc$net_avder > 0) q_rnt / mc$net_avder else rep(NA_real_, length(q_rnt))
   names(tr_per) <- paste0("tr_PER_P", c(1, 5, 10, 50, 90, 95, 99))
-  
   tr_total <- if (!is.na(mc$tr_gen_net)) mc$tr_gen_net + tr_per else rep(NA_real_, length(tr_per))
   names(tr_total) <- paste0("tr_total_P", c(1, 5, 10, 50, 90, 95, 99))
-  
-  gain_vs_1960 <- if (!is.na(mc$tr_ref_1960)) tr_total - mc$tr_ref_1960 else rep(NA_real_, length(tr_total))
-  names(gain_vs_1960) <- paste0("gain_vs_ref_1960_P", c(1, 5, 10, 50, 90, 95, 99))
+  gain_vs_objectif <- if (!is.na(mc$tr_objectif)) tr_total - mc$tr_objectif else rep(NA_real_, length(tr_total))
+  names(gain_vs_objectif) <- paste0("gain_vs_objectif_P", c(1, 5, 10, 50, 90, 95, 99))
   
   rnet_unit_det <- .simuler_unitaire_net(pay_vec, tables$perf, taux_conv, rvtg)
   t_combler <- if (!is.na(mc$montant_a_combler) && is.finite(rnet_unit_det) && rnet_unit_det > 0) mc$montant_a_combler / rnet_unit_det else NA_real_
@@ -538,36 +600,32 @@ simuler_id_MC <- function(id, generation, taux_cotisation, tables, M = 100000,
     taux_cotisation = taux_cotisation,
     taux_cotisation_effectif = taux_eff,
     tr_gen_net = mc$tr_gen_net,
-    tr_ref_1960 = mc$tr_ref_1960,
+    tr_objectif = mc$tr_objectif,
+    tr_cible_half = mc$tr_cible_half,
     net_avant_derniere = mc$net_avder,
     pension_actuelle_nette = mc$pension_actuelle_nette,
     pension_cible_nette = mc$pension_cible_nette,
+    pension_cible_nette_half = mc$pension_cible_nette_half,
     montant_a_combler = mc$montant_a_combler,
-    capital_P1 = q_cap[1],
-    capital_P5 = q_cap[2],
-    capital_P10 = q_cap[3],
-    capital_P50 = q_cap[4],
-    capital_P90 = q_cap[5],
-    capital_P95 = q_cap[6],
-    capital_P99 = q_cap[7],
-    rente_nette_P1 = q_rnt[1],
-    rente_nette_P5 = q_rnt[2],
-    rente_nette_P10 = q_rnt[3],
-    rente_nette_P50 = q_rnt[4],
-    rente_nette_P90 = q_rnt[5],
-    rente_nette_P95 = q_rnt[6],
-    rente_nette_P99 = q_rnt[7],
-    prob_succes_au_taux = prob,
+    montant_a_combler_half = mc$montant_a_combler_half,
+    capital_P1 = q_cap[1], capital_P5 = q_cap[2], capital_P10 = q_cap[3],
+    capital_P50 = q_cap[4], capital_P90 = q_cap[5], capital_P95 = q_cap[6], capital_P99 = q_cap[7],
+    rente_nette_P1 = q_rnt[1], rente_nette_P5 = q_rnt[2], rente_nette_P10 = q_rnt[3],
+    rente_nette_P50 = q_rnt[4], rente_nette_P90 = q_rnt[5], rente_nette_P95 = q_rnt[6], rente_nette_P99 = q_rnt[7],
+    prob_succes_au_taux = prob_full,
+    prob_succes_au_taux_half = prob_half,
     taux_pour_combler_ecart = t_combler
   )
   
   for (nm in names(tr_per)) res[[nm]] <- tr_per[[nm]]
   for (nm in names(tr_total)) res[[nm]] <- tr_total[[nm]]
-  for (nm in names(gain_vs_1960)) res[[nm]] <- gain_vs_1960[[nm]]
+  for (nm in names(gain_vs_objectif)) res[[nm]] <- gain_vs_objectif[[nm]]
   
   for (a in alphas) {
     lab <- sprintf("%02d", round((1 - a) * 100))
     q <- as.numeric(quantile(rnet_u, probs = a, na.rm = TRUE, names = FALSE))
+    
+    # Plein comblement
     tau_star <- if (!is.na(mc$montant_a_combler) && is.finite(q) && q > 0) mc$montant_a_combler / q else NA_real_
     tau_eff <- if (!is.na(tau_star) && remu_cum > 0) {
       cot_req <- tau_star * pay_vec
@@ -576,6 +634,16 @@ simuler_id_MC <- function(id, generation, taux_cotisation, tables, M = 100000,
     } else NA_real_
     res[[paste0("tau_star_", lab)]] <- tau_star
     res[[paste0("tau_effectif_star_", lab)]] <- tau_eff
+    
+    # Moitié du gap
+    tau_star_half <- if (!is.na(mc$montant_a_combler_half) && is.finite(q) && q > 0) mc$montant_a_combler_half / q else NA_real_
+    tau_eff_half <- if (!is.na(tau_star_half) && remu_cum > 0) {
+      cot_req <- tau_star_half * pay_vec
+      def_req <- sum(pmin(cot_req, PLAFOND_DEFISC_PCT * pay_vec) * tmi_vec, na.rm = TRUE)
+      (sum(cot_req, na.rm = TRUE) - def_req) / remu_cum
+    } else NA_real_
+    res[[paste0("tau_star_half_", lab)]] <- tau_star_half
+    res[[paste0("tau_effectif_star_half_", lab)]] <- tau_eff_half
   }
   
   res
@@ -591,13 +659,13 @@ simuler_tout_MC <- function(paths = list(
   ref = "data_permat4.csv",
   demo = "data_permat5.csv"
 ),
-taux = c(0.105),
-M = 100000,
+taux = c(0.1),
+M = 50000,
 sigma_eq = 0.18,
 sigma_bd = 0.06,
 w_start = 0.70,
 w_end = 0.20,
-alphas = c(0.01, 0.05, 0.10),
+alphas = c(0.01, 0.05, 0.10, 0.50),
 rho = 0.10) {
   raw <- charger_donnees(paths$remu, paths$perf, paths$conv, paths$ref, paths$demo)
   tables <- preparer_tables(raw$remu, raw$perf, raw$conv, raw$ref, raw$demo)
@@ -635,7 +703,7 @@ rho = 0.10) {
   file.path(base, sprintf("%s_%02dpct_%s.xlsx", prefix, round(taux * 100), stamp))
 }
 
-exporter_xlsx_taux_MC <- function(taux = 0.105,
+exporter_xlsx_taux_MC <- function(taux = 0.1,
                                   paths = list(
                                     remu = "data_permat1.csv",
                                     perf = "data_permat2.csv",
@@ -644,12 +712,12 @@ exporter_xlsx_taux_MC <- function(taux = 0.105,
                                     demo = "data_permat5.csv"
                                   ),
                                   outfile = NULL,
-                                  M = 100000,
+                                  M = 50000,
                                   sigma_eq = 0.18,
                                   sigma_bd = 0.06,
                                   w_start = 0.70,
                                   w_end = 0.20,
-                                  alphas = c(0.01, 0.05, 0.10),
+                                  alphas = c(0.01, 0.05, 0.10, 0.50),
                                   rho = 0.10) {
   res <- simuler_tout_MC(paths = paths, taux = taux, M = M, sigma_eq = sigma_eq,
                          sigma_bd = sigma_bd, w_start = w_start, w_end = w_end,
@@ -657,6 +725,7 @@ exporter_xlsx_taux_MC <- function(taux = 0.105,
   labs <- sprintf("%02d", round((1 - alphas) * 100))
   
   detail <- res %>% arrange(cas_type, generation, id)
+  
   resume <- res %>%
     group_by(cas_type, generation) %>%
     summarise(
@@ -664,7 +733,9 @@ exporter_xlsx_taux_MC <- function(taux = 0.105,
       taux_cotisation = unique(taux_cotisation)[1],
       taux_cotisation_effectif_moy = mean(taux_cotisation_effectif, na.rm = TRUE),
       montant_a_combler_total = sum(montant_a_combler, na.rm = TRUE),
+      montant_a_combler_half_total = sum(montant_a_combler_half, na.rm = TRUE),
       prob_succes_au_taux_moy = mean(prob_succes_au_taux, na.rm = TRUE),
+      prob_succes_au_taux_half_moy = mean(prob_succes_au_taux_half, na.rm = TRUE),
       !!!setNames(
         as.list(colMeans(res[paste0("rente_nette_P", c(1, 5, 10, 50, 90, 95, 99))], na.rm = TRUE)),
         paste0("rente_P", c(1, 5, 10, 50, 90, 95, 99), "_moy")
@@ -674,12 +745,16 @@ exporter_xlsx_taux_MC <- function(taux = 0.105,
         paste0("tr_total_P", c(1, 5, 10, 50, 90, 95, 99), "_moy")
       ),
       !!!setNames(
-        as.list(colMeans(res[paste0("gain_vs_ref_1960_P", c(1, 5, 10, 50, 90, 95, 99))], na.rm = TRUE)),
-        paste0("gain_vs_ref_1960_P", c(1, 5, 10, 50, 90, 95, 99), "_moy")
+        as.list(colMeans(res[paste0("gain_vs_objectif_P", c(1, 5, 10, 50, 90, 95, 99))], na.rm = TRUE)),
+        paste0("gain_vs_objectif_P", c(1, 5, 10, 50, 90, 95, 99), "_moy")
       ),
       !!!setNames(
         as.list(colMeans(res[paste0("tau_effectif_star_", labs)], na.rm = TRUE)),
         paste0("tau_effectif_star_", labs, "_moy")
+      ),
+      !!!setNames(
+        as.list(colMeans(res[paste0("tau_effectif_star_half_", labs)], na.rm = TRUE)),
+        paste0("tau_effectif_star_half_", labs, "_moy")
       ),
       nb_ids = n(),
       .groups = "drop"
@@ -702,25 +777,31 @@ exporter_xlsx_taux_MC <- function(taux = 0.105,
   eur <- openxlsx::createStyle(numFmt = "#,##0")
   
   pct_cols_detail <- which(names(detail) %in% c(
-    "taux_cotisation", "taux_cotisation_effectif", "prob_succes_au_taux",
+    "taux_cotisation", "taux_cotisation_effectif", "prob_succes_au_taux", "prob_succes_au_taux_half",
     paste0("tr_PER_P", c(1, 5, 10, 50, 90, 95, 99)),
     paste0("tr_total_P", c(1, 5, 10, 50, 90, 95, 99)),
-    paste0("tau_star_", labs), paste0("tau_effectif_star_", labs)
+    paste0("tau_star_", labs), paste0("tau_effectif_star_", labs),
+    paste0("tau_star_half_", labs), paste0("tau_effectif_star_half_", labs)
   ))
   if (length(pct_cols_detail) && nrow(detail)) {
     openxlsx::addStyle(wb, "detail", pct, rows = 2:(nrow(detail) + 1), cols = pct_cols_detail, gridExpand = TRUE)
   }
   
-  eur_cols_detail <- which(names(detail) %in% c("montant_a_combler", paste0("rente_nette_P", c(1, 5, 10, 50, 90, 95, 99))))
+  eur_cols_detail <- which(names(detail) %in% c(
+    "montant_a_combler", "montant_a_combler_half",
+    paste0("rente_nette_P", c(1, 5, 10, 50, 90, 95, 99))
+  ))
   if (length(eur_cols_detail) && nrow(detail)) {
     openxlsx::addStyle(wb, "detail", eur, rows = 2:(nrow(detail) + 1), cols = eur_cols_detail, gridExpand = TRUE)
   }
   
   pct_cols_resume <- which(names(resume) %in% c(
     "taux_cotisation", "taux_cotisation_effectif_moy",
+    "prob_succes_au_taux_moy", "prob_succes_au_taux_half_moy",
     paste0("tr_total_P", c(1, 5, 10, 50, 90, 95, 99), "_moy"),
-    paste0("gain_vs_ref_1960_P", c(1, 5, 10, 50, 90, 95, 99), "_moy"),
-    paste0("tau_effectif_star_", labs, "_moy")
+    paste0("gain_vs_objectif_P", c(1, 5, 10, 50, 90, 95, 99), "_moy"),
+    paste0("tau_effectif_star_", labs, "_moy"),
+    paste0("tau_effectif_star_half_", labs, "_moy")
   ))
   if (length(pct_cols_resume) && nrow(resume)) {
     openxlsx::addStyle(wb, "resume", pct, rows = 2:(nrow(resume) + 1), cols = pct_cols_resume, gridExpand = TRUE)
@@ -741,4 +822,6 @@ exporter_xlsx_taux_MC <- function(taux = 0.105,
 # ============================================
 # Exemple d'appel
 # ============================================
-exporter_xlsx_taux_MC(taux = 0.105)
+exporter_xlsx_taux_MC(taux = 0.1)
+
+
